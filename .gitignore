@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+state.json
+state.json.tmp
+bridge.env
+.env
+*.log
+.DS_Store

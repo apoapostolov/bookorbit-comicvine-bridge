@@ -1,0 +1,19 @@
+[Unit]
+Description=ComicVine Bridge for BookOrbit
+Documentation=https://github.com/apoapostolov/bookorbit-comicvine-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=apoapostolov
+WorkingDirectory=/opt/comicvine-bridge
+EnvironmentFile=/opt/comicvine-bridge/bridge.env
+ExecStart=/usr/bin/python3 /opt/comicvine-bridge/bridge.py
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
