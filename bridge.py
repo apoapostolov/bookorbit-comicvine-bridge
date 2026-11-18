@@ -2,12 +2,23 @@
 """ComicVine Bridge for BookOrbit.
 
 Scans a BookOrbit comics library and fills missing issue metadata from the
-ComicVine API at a staggered, checkpointed rate. Each ComicVine lookup is
-limited to a single issue whose series and issue number can be parsed from
-the book's title; compilations are skipped by design.
+ComicVine API at a staggered, checkpointed rate.
 
-State is written to a JSON file after every book so the service can be
-stopped and resumed without repeating lookups.
+Lookups go through ComicVine's structured filters, not its fuzzy issue search:
+a series name resolves to a volume once, that volume's whole issue list is
+fetched once and cached, and every book in the series is then matched against
+it locally. The old approach queried `/search/?resources=issue&query=<series>
+<issue>`, which answers with ten relevance-ranked issues drawn from any volume,
+so the right issue was frequently absent from the page and the book was
+reported as "no match" although ComicVine holds it.
+
+Where a series name matches several volumes, the book's own publication year
+decides which run it belongs to. With no year and no single candidate the book
+is left unmatched rather than guessed at.
+
+State is written to a JSON file after every book so the service can be stopped
+and resumed without repeating lookups. Volume candidates and issue lists are
+cached beside the state file and never expire.
 """
 
 from __future__ import annotations
@@ -26,13 +37,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
-CV_SEARCH_URL = "https://comicvine.gamespot.com/api/search/"
-CV_FIELDS = ",".join([
-    "id", "name", "issue_number", "volume", "cover_date",
-    "description", "image", "resource_type",
-])
+CV_BASE = "https://comicvine.gamespot.com/api/"
+CV_VOLUME_FIELDS = "id,name,start_year,count_of_issues,publisher"
+CV_ISSUE_FIELDS = "id,issue_number,name,volume,cover_date,description"
 
 DEFAULT_BOOKORBIT_URL = "http://192.168.1.217:8123/api/v1"
 DEFAULT_STATE = "state.json"
@@ -46,6 +55,8 @@ COMPILATION_RE = re.compile(
 HASH_ISSUE_RE = re.compile(r"#\s*0*(\d{1,4})(?:[a-z])?\b", re.IGNORECASE)
 BARE_ISSUE_RE = re.compile(r"(?:^|\s)0*(\d{1,4})(?:[a-z])?(?=\s|\)|$|\.(?:\s|$))", re.IGNORECASE)
 YEAR_RE = re.compile(r"\((19|20)\d{2}\)")
+TRAILING_YEAR_RE = re.compile(r"^(?P<base>.*?)\s+(?P<year>(?:19|20)\d{2})$")
+VOLUME_SUFFIX_RE = re.compile(r"\s+(?:v|vol\.?|volume)\s*\d+$", re.IGNORECASE)
 
 
 def log(msg: str) -> None:
@@ -68,6 +79,43 @@ def normalize_series(name: str) -> str:
     s = re.sub(r"^(the)\s+", "", s.strip(), flags=re.IGNORECASE)
     s = re.sub(r"[^a-z0-9]", "", s.lower())
     return s
+
+
+def normalize_issue(number: Any) -> str:
+    """Fold an issue number to a comparable token: '002', '2' and ' 2 ' agree."""
+    text = str(number or "").strip().lower()
+    text = text.replace("½", "0.5").replace("¼", "0.25").replace("¾", "0.75")
+    match = re.match(r"^0*(\d+(?:\.\d+)?)(.*)$", text)
+    if match:
+        return match.group(1) + match.group(2)
+    return text
+
+
+def split_series_year(series: str) -> tuple[str, int | None]:
+    """'Swamp Thing 1971' -> ('Swamp Thing', 1971); a bare name keeps its year of None."""
+    match = TRAILING_YEAR_RE.match(series.strip())
+    if not match:
+        return series, None
+    base = match.group("base").strip()
+    if len(base) < 2:
+        return series, None
+    return base, int(match.group("year"))
+
+
+def series_tokens(series: str) -> list[str]:
+    """Progressively plainer names to try against ComicVine's name filter."""
+    base, _ = split_series_year(series)
+    base = VOLUME_SUFFIX_RE.sub("", base).strip() or base
+    tokens = [series]
+    for token in (base,):
+        if token and token not in tokens:
+            tokens.append(token)
+    for separator in (" - ", ": "):
+        if separator in base:
+            head = base.split(separator, 1)[0].strip()
+            if len(head) >= 3 and head not in tokens:
+                tokens.append(head)
+    return tokens
 
 
 def parse_issue(title: str) -> tuple[str, str] | None:
@@ -163,62 +211,194 @@ class BookOrbit:
 
 
 class ComicVine:
-    def __init__(self, key: str, limiter: RateLimiter, timeout: int = 30):
+    """Structured lookups: name -> volumes, volume -> every issue, matched locally."""
+
+    def __init__(self, key: str, limiter: RateLimiter, cache_dir: Path, timeout: int = 30):
         self.key = key
         self.limiter = limiter
+        self.cache_dir = cache_dir
         self.timeout = timeout
         self.calls = 0
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.volumes_path = self.cache_dir / "volumes.json"
+        self.failed = False
+        self.volumes: dict[str, list[dict]] = self._load_json(self.volumes_path) or {}
 
-    def search(self, series: str, issue: str) -> list[dict]:
+    def _load_json(self, path: Path) -> Any:
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _save_json(self, path: Path, value: Any) -> None:
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, separators=(",", ":"))
+        tmp.replace(path)
+
+    def _get(self, resource: str, params: dict) -> dict | None:
         wait = self.limiter.wait_time(time.time())
         if wait > 0:
             log(f"rate window full; waiting {int(wait)}s before the next lookup")
             time.sleep(wait)
-        params = urllib.parse.urlencode({
-            "api_key": self.key,
-            "format": "json",
-            "resources": "issue",
-            "query": f"{series} {issue}",
-            "field_list": CV_FIELDS,
-            "limit": "10",
-        })
+        query = dict(params, api_key=self.key, format="json")
         req = urllib.request.Request(
-            CV_SEARCH_URL + "?" + params,
-            headers={"User-Agent": "ComicVineBridge/1.0", "Accept": "application/json"},
+            CV_BASE + resource + "?" + urllib.parse.urlencode(query),
+            headers={"User-Agent": f"ComicVineBridge/{VERSION}", "Accept": "application/json"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            log(f"ComicVine HTTP {exc.code} for '{series} {issue}'")
-            self.limiter.record()
-            self.calls += 1
-            return []
+        self.failed = False
+        payload = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                self.calls += 1
+                if exc.code == 420 and attempt < 2:
+                    # The key's hourly budget is spent. Wait it out rather than recording the
+                    # books of this series as "no match", which no later run would revisit.
+                    pause = 120 * (attempt + 1)
+                    log(f"ComicVine rate limit reached ({attempt + 1}/3); pausing {pause}s")
+                    self.failed = True
+                    time.sleep(pause)
+                    continue
+                self.failed = True
+                self.limiter.record()
+                log(f"ComicVine HTTP {exc.code} for {resource} {params.get('filter') or params.get('query')}")
+                return None
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                # A DNS blip must not kill a run with hours of work ahead of it, and must not be
+                # cached as if ComicVine had answered with nothing.
+                self.failed = True
+                self.calls += 1
+                log(f"ComicVine unreachable for {resource}: {exc}")
+                time.sleep(30)
+                return None
+        if payload is None:
+            return None
         self.limiter.record()
         self.calls += 1
         if payload.get("status_code") != 1:
-            log(f"ComicVine error {payload.get('status_code')} for '{series} {issue}'")
-            return []
-        return payload.get("results", []) or []
+            self.failed = True
+            log(f"ComicVine error {payload.get('status_code')} for {resource} {params.get('filter')}")
+            return None
+        self.failed = False
+        return payload
+
+    def resolve_volumes(self, series: str) -> list[dict]:
+        """Every volume whose name is plausibly this series; cached per series token."""
+        if series in self.volumes:
+            return self.volumes[series]
+        base, _ = split_series_year(series)
+        want_full = normalize_series(series)
+        want_base = normalize_series(VOLUME_SUFFIX_RE.sub("", base).strip() or base)
+        found: list[dict] = []
+        for token in series_tokens(series):
+            payload = self._get("volumes/", {
+                "filter": f"name:{token}",
+                "field_list": CV_VOLUME_FIELDS,
+                "limit": "100",
+            })
+            volumes = (payload or {}).get("results", []) or []
+            if not volumes:
+                continue
+            exact = [v for v in volumes
+                     if normalize_series(str(v.get("name", ""))) in (want_full, want_base)]
+            if exact:
+                # A run can sit under an author or imprint prefix, as "Garth Ennis' 303" does
+                # beside a one-issue "303", so looser matches join the list and the issue
+                # coverage in score_volumes decides between them.
+                looser = [v for v in volumes
+                          if normalize_series(str(v.get("name", ""))).endswith(want_base)
+                          or normalize_series(str(v.get("name", ""))).startswith(want_base)]
+                found = exact + [v for v in looser if v["id"] not in {e["id"] for e in exact}]
+                break
+            prefix = [v for v in volumes
+                      if normalize_series(str(v.get("name", ""))).startswith(want_base)]
+            if len(prefix) == 1:
+                found = prefix
+                break
+        if not found:
+            payload = self._get("search/", {
+                "resources": "volume",
+                "query": series,
+                "field_list": CV_VOLUME_FIELDS,
+                "limit": "20",
+            })
+            volumes = (payload or {}).get("results", []) or []
+            exact = [v for v in volumes
+                     if normalize_series(str(v.get("name", ""))) in (want_full, want_base)]
+            if len(exact) == 1:
+                found = exact
+        if found or not self.failed:
+            self.volumes[series] = found
+            self._save_json(self.volumes_path, self.volumes)
+        if found:
+            described = ", ".join(
+                "{} {} ({})".format(v.get("id"), v.get("name"), v.get("start_year")) for v in found
+            )
+            log(f"series '{series}' -> {described}")
+        return found
+
+    def score_volumes(self, candidates: list[dict], wanted: set[str], limit: int = 4) -> list[tuple[int, dict, list[dict]]]:
+        """Rank the likeliest runs by how many of this series' issue numbers each one holds.
+
+        A name such as "Action Comics" maps to a dozen volumes; only the ones that actually
+        contain the numbers in the library can be the right run, so the issue lists decide.
+        At most `limit` candidates are fetched, largest first, to bound the request cost.
+        """
+        ranked = sorted(candidates, key=lambda v: -(v.get("count_of_issues") or 0))[:limit]
+        scored: list[tuple[int, dict, list[dict]]] = []
+        for volume in ranked:
+            issues = self.volume_issues(volume)
+            have = {normalize_issue(r.get("issue_number")) for r in issues}
+            scored.append((len(wanted & have), volume, issues))
+        scored.sort(key=lambda t: (-t[0], -(t[1].get("count_of_issues") or 0)))
+        return scored
+
+    def volume_issues(self, volume: dict) -> list[dict]:
+        """Every issue of a volume, cached on disk; a handful of requests per series, once."""
+        path = self.cache_dir / f"issues-{volume['id']}.json"
+        cached = self._load_json(path)
+        if cached is not None:
+            return cached
+        collected: list[dict] = []
+        offset = 0
+        complete = True
+        while True:
+            payload = self._get("issues/", {
+                "filter": f"volume:{volume['id']}",
+                "field_list": CV_ISSUE_FIELDS,
+                "limit": "100",
+                "offset": str(offset),
+            })
+            if payload is None:
+                complete = False
+                break
+            results = payload.get("results", []) or []
+            collected.extend(results)
+            if len(results) < 100:
+                break
+            offset += 100
+        # A half-fetched list must never be cached: the cached copy is what later runs trust.
+        if collected and complete:
+            self._save_json(path, collected)
+        log(f"volume {volume['id']}: {len(collected)} issues cached")
+        return collected
 
 
-def best_match(results: list[dict], series: str, issue: str) -> dict | None:
-    """Accept only an exact series+issue match; skip ambiguous compilations."""
-    target = normalize_series(series)
-    candidates = []
-    for result in results:
-        if str(result.get("issue_number", "")).strip().lstrip("0") != issue.lstrip("0"):
-            continue
-        volume = result.get("volume") or {}
-        if normalize_series(str(volume.get("name", ""))) != target:
-            continue
-        candidates.append(result)
-    if len(candidates) != 1:
+def pick_issue(issues: list[dict], issue: str) -> dict | None:
+    """Match an issue number against a volume's issue list, earliest printing first."""
+    want = normalize_issue(issue)
+    hits = [r for r in issues if normalize_issue(r.get("issue_number")) == want]
+    if not hits:
         return None
-    chosen = candidates[0]
-    if not (chosen.get("id") and (chosen.get("volume") or {}).get("id")):
-        return None
-    return chosen
+    hits.sort(key=lambda r: str(r.get("cover_date") or "9999-99-99"))
+    return hits[0]
 
 
 def build_patch(match: dict) -> dict:
@@ -276,75 +456,135 @@ def main() -> int:
     parser.add_argument("--state", default=os.environ.get("STATE_FILE", DEFAULT_STATE))
     parser.add_argument("--limit", type=int, default=0, help="Stop after N newly processed books (0 = all).")
     parser.add_argument("--dry-run", action="store_true", help="Query ComicVine but do not write to BookOrbit.")
+    parser.add_argument("--retry-no-match", action="store_true",
+                        help="Forget previous 'no match' results so they are looked up again.")
     parser.add_argument("--rate-limit", type=int, default=int(os.environ.get("CV_RATE_LIMIT", "200")))
     parser.add_argument("--window", type=int, default=3600)
     args = parser.parse_args()
 
     bookorbit_key = read_secret(args.bookorbit_key or os.environ.get("BOOKORBIT_API_KEY"), args.bookorbit_key_file)
     comicvine_key = read_secret(args.comicvine_key or os.environ.get("COMICVINE_API_KEY"), args.comicvine_key_file)
+
     state_path = Path(args.state).expanduser()
+    cache_dir = state_path.parent / "cv-cache"
 
     state = load_state(state_path)
+    if args.retry_no_match:
+        stale = [k for k, v in state["processed"].items() if v.get("status") == "no_match"]
+        for key in stale:
+            state["processed"].pop(key, None)
+        log(f"forgot {len(stale)} previous 'no match' results")
+        save_state(state_path, state)
     if not state.get("startedAt"):
         state["startedAt"] = datetime.now(timezone.utc).isoformat()
         save_state(state_path, state)
+    state.setdefault("stats", {"matched": 0, "no_match": 0, "skipped": 0, "error": 0})
 
     limiter = RateLimiter.from_state(state.get("calls", []), args.rate_limit, args.window)
     bo = BookOrbit(args.bookorbit_url, bookorbit_key)
-    cv = ComicVine(comicvine_key, limiter)
+    cv = ComicVine(comicvine_key, limiter, cache_dir)
 
     log(f"starting library {args.library_id}: {len(state['processed'])} books already processed")
-    processed_this_run = 0
 
+    pending: dict[str, list[dict]] = {}
     for book in bo.books(args.library_id):
         book_id = str(book.get("id"))
         if not book_id or book_id in state["processed"]:
             continue
-
         parsed = parse_issue(book.get("title", ""))
         if not parsed:
             state["processed"][book_id] = {"status": "skipped"}
             state["stats"]["skipped"] += 1
             save_state(state_path, state)
             continue
-
         series, issue = parsed
-        results = cv.search(series, issue)
-        match = best_match(results, series, issue)
-        if not match:
-            state["processed"][book_id] = {"status": "no_match", "series": series, "issue": issue}
-            state["stats"]["no_match"] += 1
-            log(f"no match: {book.get('title')}")
-        else:
-            patch = build_patch(match)
-            if args.dry_run:
-                log(f"DRY RUN would patch {book_id}: {book.get('title')} -> {patch.get('comicvineId')}")
-            else:
-                try:
-                    bo.patch_metadata(int(book_id), patch)
-                    state["stats"]["matched"] += 1
-                    log(f"patched {book_id}: {book.get('title')} -> {patch.get('comicvineId')}")
-                except Exception as exc:  # noqa: BLE001 - keep the service alive on one bad book
-                    state["stats"]["error"] += 1
-                    log(f"write error {book_id}: {type(exc).__name__}: {exc}")
-                    state["processed"][book_id] = {"status": "error"}
-                    save_state(state_path, state)
-                    continue
-            state["processed"][book_id] = {
-                "status": "matched", "comicvineId": patch.get("comicvineId"),
-                "series": series, "issue": issue,
-            }
-        state["calls"] = cv.limiter.to_state()
-        save_state(state_path, state)
+        year = book.get("publishedYear")
+        pending.setdefault(series, []).append({
+            "id": book_id, "title": book.get("title", ""), "issue": issue,
+            "year": year if isinstance(year, int) else None,
+        })
 
-        processed_this_run += 1
-        if args.limit and processed_this_run >= args.limit:
-            log(f"limit of {args.limit} reached this run; stopping")
+    log(f"{sum(len(v) for v in pending.values())} books across {len(pending)} series to look up")
+    processed_this_run = 0
+    stopped_early = False
+
+    for series, books in pending.items():
+        candidates = cv.resolve_volumes(series)
+        if not candidates and cv.failed:
+            # ComicVine was unreachable or rate-limited; leave these books for the next run
+            # instead of recording a failure that would never be looked at again.
+            log(f"skipping series '{series}': ComicVine unavailable")
+            stopped_early = True
             break
+        wanted = {normalize_issue(b["issue"]) for b in books}
+        ranked = cv.score_volumes(candidates, wanted) if candidates else []
+        if not ranked and cv.failed:
+            log(f"skipping series '{series}': no volume list could be fetched")
+            stopped_early = True
+            break
+        best = ranked[0] if ranked and ranked[0][0] > 0 else None
+        others = [entry for entry in ranked[1:] if entry[0] > 0]
+        if best:
+            log(f"{series}: {len(books)} books -> volume {best[1]['id']} '{best[1]['name']}' "
+                f"covers {best[0]} of {len(wanted)} numbers")
+        for book in books:
+            match = None
+            if best:
+                match = pick_issue(best[2], book["issue"])
+            if match is None and others:
+                # A number that the leading run does not hold may belong to a sibling run;
+                # accept it only when exactly one other volume claims it.
+                claims = [entry for entry in others if pick_issue(entry[2], book["issue"])]
+                if len(claims) == 1:
+                    match = pick_issue(claims[0][2], book["issue"])
+            book_id = book["id"]
+            if not match and cv.failed:
+                log(f"leaving {book['title']} for the next run: ComicVine unavailable")
+                continue
+            if not match:
+                state["processed"][book_id] = {"status": "no_match", "series": series,
+                                               "issue": book["issue"], "volumes": len(candidates)}
+                state["stats"]["no_match"] += 1
+                log(f"no match: {book['title']}")
+            else:
+                patch = build_patch(match)
+                if args.dry_run:
+                    log(f"DRY RUN would patch {book_id}: {book['title']} -> {patch.get('comicvineId')}")
+                else:
+                    try:
+                        bo.patch_metadata(int(book_id), patch)
+                        state["stats"]["matched"] += 1
+                        log(f"patched {book_id}: {book['title']} -> {patch.get('comicvineId')}")
+                    except Exception as exc:  # noqa: BLE001 - keep the service alive on one bad book
+                        state["stats"]["error"] += 1
+                        log(f"write error {book_id}: {type(exc).__name__}: {exc}")
+                        state["processed"][book_id] = {"status": "error"}
+                        state["calls"] = cv.limiter.to_state()
+                        save_state(state_path, state)
+                        continue
+                state["processed"][book_id] = {
+                    "status": "matched", "comicvineId": patch.get("comicvineId"),
+                    "series": series, "issue": book["issue"],
+                }
+            state["calls"] = cv.limiter.to_state()
+            save_state(state_path, state)
+
+            processed_this_run += 1
+            if args.limit and processed_this_run >= args.limit:
+                log(f"limit of {args.limit} reached this run; stopping")
+                state["finishedAt"] = datetime.now(timezone.utc).isoformat()
+                save_state(state_path, state)
+                log(f"complete: {json.dumps(state['stats'])}")
+                return 0
 
     state["finishedAt"] = datetime.now(timezone.utc).isoformat()
     save_state(state_path, state)
     log(f"complete: {json.dumps(state['stats'])}")
+    if stopped_early:
+        # Exit non-zero so the unit's Restart=on-failure brings the run back once the key's
+        # hourly budget has refilled, instead of the service sitting dead.
+        log("stopped because ComicVine was unavailable; the service will restart and resume")
+        return 2
     return 0
 
 

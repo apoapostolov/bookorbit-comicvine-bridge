@@ -4,6 +4,21 @@ All notable changes to this project are documented here. This project follows [K
 
 ## [Unreleased]
 
+### Changed
+
+- Matching now uses ComicVine's structured filters instead of its fuzzy search. A series name resolves to a volume through `/volumes/?filter=name:`, that volume's whole issue list is fetched once and cached, and every book in the series is matched against it locally. The search endpoint returns ten relevance-ranked issues from any volume, so a correct issue was frequently absent from the page: on a real 400-book sample of the same library the old path matched 28 percent of books and the new one 92 percent.
+- When a name maps to several runs, the volume holding more of the library's issue numbers wins rather than the one with the most issues overall. A number no candidate holds is accepted only when exactly one sibling run claims it, so a wrong volume is never preferred over no match.
+- Volume candidates and issue lists are cached in `cv-cache/` beside the state file and never expire, which also cuts the request cost: a whole series costs two calls instead of one call per book.
+
+### Fixed
+
+- A transient failure no longer poisons the record. Rate-limited, timed-out and unresolvable requests are retried, and a book whose lookup could not complete is left unrecorded so the next run picks it up, instead of being stored as unmatched forever. An incomplete issue list is never cached.
+- A rate limit waits for the budget to refill rather than ending the run, and a run that still cannot reach ComicVine exits non-zero so the unit's `Restart=on-failure` resumes it.
+
+### Added
+
+- `--retry-no-match` forgets previous unmatched results so they are looked up again, which is what makes a matching fix retroactive for an existing library.
+
 ## [1.0.0] - 2026-11-17
 
 ### Added

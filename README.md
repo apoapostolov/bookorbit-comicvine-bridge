@@ -29,7 +29,17 @@ For each single issue with a confident match, the bridge sets:
 - `publishedDate` and `publishedYear` from the cover date
 - `comicMetadata.issueNumber` and `comicMetadata.volumeName`
 
-It deliberately does **not** touch series, title, language, or the filesystem. Folder-derived series names survive a run unchanged, and no archive is renamed or repacked. A match is accepted only when exactly one ComicVine result agrees on both the series and the issue number. Anything ambiguous is skipped and recorded.
+It deliberately does **not** touch series, title, language, or the filesystem. Folder-derived series names survive a run unchanged, and no archive is renamed or repacked.
+
+## How a match is found
+
+ComicVine's search endpoint answers with ten relevance-ranked issues drawn from every volume it knows, so asking it for "Hellblazer 280" returns issue 280 of Viz, Wolverine and Judge Dredd before the one you want, and asking for a series with a common word often returns the right volume's issue not at all. The bridge therefore uses the structured filters instead:
+
+1. The series name resolves to a volume through `/volumes/?filter=name:`, caching the answer per series name.
+2. That volume's full issue list is fetched and cached, two to nine pages of a hundred, once per run of the series.
+3. Each book is matched against that list by issue number, locally and exactly.
+
+When one name maps to several runs, as "Action Comics" does, the volume that actually contains more of the library's issue numbers wins, and a number held by none of them is checked against the sibling runs and accepted only when exactly one of them claims it. Nothing is attached on a guess. Where the name resolves to no volume at all, the book is recorded as unmatched instead of being given another series' metadata.
 
 ## Install
 
